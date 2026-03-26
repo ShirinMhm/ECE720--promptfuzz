@@ -1,0 +1,6 @@
+.vscode
+__pycache__
+*.log
+*.pyc
+*.csv
+Results/
