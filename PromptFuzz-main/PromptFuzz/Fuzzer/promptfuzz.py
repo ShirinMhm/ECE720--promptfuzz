@@ -9,6 +9,7 @@ from gptfuzzer.fuzzer.mutator import (
     MutateRandomSinglePolicy, NoMutatePolicy, MutateWeightedSamplingPolicy, OpenAIMutatorCrossOver, OpenAIMutatorExpand,
     OpenAIMutatorGenerateSimilar, OpenAIMutatorRephrase, OpenAIMutatorShorten)
 from gptfuzzer.fuzzer import GPTFuzzer
+from gptfuzzer.fuzzer.budget_scheduler import MultiFidelityScheduler
 from gptfuzzer.utils.predict import MatchPredictor, AccessGrantedPredictor
 from gptfuzzer.llm import OpenAILLM, OpenAIEmbeddingLLM
 from PromptFuzz.utils import constants
@@ -129,6 +130,21 @@ def run_fuzzer(args):
         
     update_pool = True if args.phase == 'focus' else False
     
+    # Build multi-fidelity scheduler if requested
+    scheduler = None
+    if getattr(args, 'multifidelity', False):
+        stage_fractions = getattr(args, 'stage_fractions', [0.2, 0.5, 1.0])
+        beta = getattr(args, 'budget_beta', 1.0)
+        top_k_fractions = getattr(args, 'top_k_fractions', [0.5, 0.5])
+        promotion_threshold = getattr(args, 'promotion_threshold', 0.0)
+        scheduler = MultiFidelityScheduler(
+            stage_fractions=stage_fractions,
+            beta=beta,
+            top_k_fractions=top_k_fractions,
+            promotion_threshold=promotion_threshold,
+        )
+        print(f"[MultiFidelity] Scheduler enabled: stages={stage_fractions}, beta={beta}")
+
     fuzzer = GPTFuzzer(
         defenses=args.defenses,
         target=target_model,
@@ -142,7 +158,8 @@ def run_fuzzer(args):
         max_query=args.max_query,
         update_pool=update_pool,
         dynamic_allocate=args.dynamic_allocate,
-        threshold_coefficient=args.threshold_coefficient
+        threshold_coefficient=args.threshold_coefficient,
+        scheduler=scheduler,
     )
 
     fuzzer.run()

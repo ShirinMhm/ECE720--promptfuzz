@@ -2,16 +2,20 @@ import logging
 import time
 import csv
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .mutator import Mutator, MutatePolicy
     from .selection import SelectPolicy
+    from .budget_scheduler import MultiFidelityScheduler
 
 from gptfuzzer.llm import LLM
 from gptfuzzer.utils.template import synthesis_message
 from gptfuzzer.utils.predict import Predictor
 import warnings
+
+# Sentinel used by MultiFidelityScheduler for budget-eliminated nodes
+_BUDGET_ELIMINATED = "budget_eliminated"
 
 
 class PromptNode:
@@ -76,6 +80,7 @@ class GPTFuzzer:
                  update_pool: bool = True,
                  dynamic_allocate: bool = False,
                  threshold_coefficient: float = 0.5,
+                 scheduler: 'Optional[MultiFidelityScheduler]' = None,
                  ):
 
         self.defenses: 'list[dict]' = defenses
@@ -106,7 +111,7 @@ class GPTFuzzer:
         if result_file is None:
             result_file = f'results-{time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())}.csv'
 
-        self.raw_fp = open(result_file, 'w', buffering=1)
+        self.raw_fp = open(result_file, 'w', buffering=1, encoding='utf-8')
         self.writter = csv.writer(self.raw_fp)
         self.writter.writerow(
             ['index', 'prompt', 'response', 'parent', 'results', 'mutation', 'query'])
@@ -117,6 +122,12 @@ class GPTFuzzer:
         self.threshold = 0
         self.highest_jailbreak = 0
         self.threshold_coefficient = threshold_coefficient
+
+        # Multi-fidelity budget scheduler (None = use original full evaluation)
+        self.scheduler = scheduler
+        if self.scheduler is not None:
+            self.scheduler.fuzzer = self
+
         self.setup()
 
     def setup(self):
@@ -151,6 +162,12 @@ class GPTFuzzer:
         self.raw_fp.close()
 
     def evaluate(self, prompt_nodes: 'list[PromptNode]'):
+        # --- Multi-fidelity path ---
+        if self.scheduler is not None:
+            self.scheduler.evaluate(prompt_nodes)
+            return
+
+        # --- Original full-evaluation path (unchanged) ---
         # Initialize response and results as empty lists for each prompt node
         for prompt_node in prompt_nodes:
             prompt_node.response = []
@@ -185,7 +202,7 @@ class GPTFuzzer:
         self.current_iteration += 1
 
         for prompt_node in prompt_nodes:
-            if prompt_node.prompt != 'early termination' and prompt_node.num_jailbreak > 0:
+            if prompt_node.prompt not in ('early termination', 'budget_eliminated') and prompt_node.num_jailbreak > 0:
                 prompt_node.index = len(self.prompt_nodes)
                 if self.update_pool:
                     self.prompt_nodes.append(prompt_node)
@@ -209,4 +226,8 @@ class GPTFuzzer:
             
     def log(self):
         logging.info(
-            f"Iteration {self.current_iteration}: {self.current_jailbreak} jailbreaks, {self.current_reject} rejects, {self.current_query} queries")
+            f"Iteration {self.current_iteration}: {self.current_jailbreak} jailbreaks, "
+            f"{self.current_reject} rejects, {self.current_query} queries"
+        )
+        if self.scheduler is not None:
+            logging.info(self.scheduler.summary())
