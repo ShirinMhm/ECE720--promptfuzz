@@ -173,3 +173,103 @@ class EXP3SelectPolicy(SelectPolicy):
         x = -1 * r / self.probs[self.last_choice_index]
         self.weights[self.last_choice_index] *= np.exp(
             self.alpha * x / len(self.fuzzer.prompt_nodes))
+
+
+class CoverageGuidedSelectPolicy(SelectPolicy):
+    """
+    Seed selection policy that combines ASR reward with defense-family novelty.
+
+    Score = λ · (ASR reward) + (1 − λ) · Novelty
+
+    Where:
+      - ASR reward  = MCTS-style UCB reward normalised by visits (same as
+                      MCTSExploreSelectPolicy)
+      - Novelty     = fraction of uncovered defense clusters that this seed
+                      (and its best descendant) has successfully attacked
+
+    This ensures that seeds which open up new defense families are preferred
+    over seeds with slightly higher raw ASR but no new coverage.
+
+    Parameters
+    ----------
+    coverage_tracker : DefenseCoverageTracker
+        Must already be set up (setup() called).
+    lam : float
+        λ weight. Overrides coverage_tracker.lam if provided.
+    ratio : float
+        UCB exploration ratio (same role as in MCTSExploreSelectPolicy).
+    alpha : float
+        MCTS level-penalty coefficient.
+    beta : float
+        UCB lower bound coefficient.
+    """
+
+    def __init__(
+        self,
+        coverage_tracker,
+        lam: float = None,
+        ratio: float = 0.5,
+        alpha: float = 0.1,
+        beta: float = 0.2,
+        fuzzer: GPTFuzzer = None,
+    ):
+        super().__init__(fuzzer)
+        self.coverage_tracker = coverage_tracker
+        # lam: use tracker's value by default so there's one source of truth
+        self.lam = lam if lam is not None else coverage_tracker.lam
+        self.ratio = ratio
+        self.alpha = alpha
+        self.beta = beta
+
+        self.step = 0
+        self.mctc_select_path = []
+        self.last_choice_index = None
+        self.rewards = []
+
+    def select(self) -> PromptNode:
+        self.step += 1
+        if len(self.fuzzer.prompt_nodes) > len(self.rewards):
+            self.rewards.extend(
+                [0.0] * (len(self.fuzzer.prompt_nodes) - len(self.rewards))
+            )
+
+        self.mctc_select_path.clear()
+
+        def _score(pn: PromptNode) -> float:
+            ucb_term = (
+                self.rewards[pn.index] / (pn.visited_num + 1)
+                + self.ratio * np.sqrt(2 * np.log(self.step) / (pn.visited_num + 0.01))
+            )
+            # Novelty: use the last evaluated defense indices stored by the scheduler,
+            # or fall back to 0 if scheduler hasn't set them yet
+            scheduler = getattr(self.fuzzer, "scheduler", None)
+            if scheduler is not None and hasattr(scheduler, "_last_eval_def_indices"):
+                def_indices = scheduler._last_eval_def_indices.get(id(pn), [])
+            else:
+                def_indices = []
+            nov = self.coverage_tracker.novelty(pn, def_indices)
+            return self.lam * ucb_term + (1.0 - self.lam) * nov
+
+        cur = max(self.fuzzer.initial_prompts_nodes, key=_score)
+        self.mctc_select_path.append(cur)
+
+        while len(cur.child) > 0:
+            if np.random.rand() < self.alpha:
+                break
+            cur = max(cur.child, key=_score)
+            self.mctc_select_path.append(cur)
+
+        for pn in self.mctc_select_path:
+            pn.visited_num += 1
+
+        self.last_choice_index = cur.index
+        return cur
+
+    def update(self, prompt_nodes):
+        succ_num = sum(pn.num_jailbreak for pn in prompt_nodes)
+        last_choice_node = self.fuzzer.prompt_nodes[self.last_choice_index]
+        for pn in reversed(self.mctc_select_path):
+            reward = succ_num / (len(self.fuzzer.defenses) * len(prompt_nodes))
+            self.rewards[pn.index] += reward * max(
+                self.beta, (1 - 0.1 * last_choice_node.level)
+            )

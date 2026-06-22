@@ -1,9 +1,8 @@
 import sys
 import os
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'PromptFuzz')))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'PromptFuzz', 'Fuzzer')))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add the path to the PromptFuzz folder to sys.path
+sys.path.append(os.path.abspath('../PromptFuzz/'))
 import json
 import argparse
 from PromptFuzz.Fuzzer.promptfuzz import run_fuzzer
@@ -57,6 +56,29 @@ if __name__ == "__main__":
         "--promotion_threshold", type=float, default=0.0,
         help="Minimum LCB score required for promotion. "
              "0.0 = always promote top-k regardless of absolute ASR."
+    )
+
+    # ---- Part B: Coverage-guided exploration args ----
+    parser.add_argument(
+        "--coverage_guided", action='store_true',
+        help="Enable coverage-guided exploration (defense-family clustering + novelty scoring). "
+             "Requires --multifidelity to also be set for full effect, but can be used "
+             "independently to activate CoverageGuidedSelectPolicy."
+    )
+    parser.add_argument(
+        "--cluster_k", type=int, default=8,
+        help="Number of defense family clusters (K). Rule of thumb: sqrt(|D|). "
+             "For the 40-defense focus set, 6-8 is a good range."
+    )
+    parser.add_argument(
+        "--coverage_lam", type=float, default=0.7,
+        help="λ in Score = λ·ASR + (1-λ)·Novelty. "
+             "1.0 = pure ASR (disables novelty), 0.0 = pure novelty."
+    )
+    parser.add_argument(
+        "--embedding_cache", type=str, default=None,
+        help="Path to cache defense embeddings (avoids recomputing on repeated runs). "
+             "Saved as a .npy file, e.g. ./defense_embeddings.npy"
     )
 
     args = parser.parse_args()

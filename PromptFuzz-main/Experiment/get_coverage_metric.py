@@ -1,370 +1,246 @@
 """
-get_coverage_metric.py
-----------------------
-Extended metrics reporter for the budget-aware + coverage-guided extension.
-
-In addition to the standard bestASR / ESR / coverage from get_metric.py,
-this script computes:
-
-  - Per-cluster (defense family) coverage  — which families were broken
-  - Coverage efficiency  — families broken per 100 queries
-  - queries_to_first_cover[k]  — how many queries it took to cover k% of families
-  - Coverage curve  — coverage fraction at each query checkpoint
-
-Usage
------
-# Single file, basic metrics + per-cluster breakdown:
-python get_coverage_metric.py \\
-    --result_csv  ./Results/focus/hijacking/mf_coverage/all_results.csv \\
-    --defense_file ./Datasets/hijacking_focus_defense.jsonl \\
-    --cluster_k 8 \\
-    --openai_key sk-... \\
-    --embedding_cache ./defense_embeddings.npy
-
-# Compare multiple conditions side-by-side:
-python get_coverage_metric.py \\
-    --compare \\
-    --result_csvs baseline.csv mf_default.csv mf_coverage.csv \\
-    --labels Baseline MF-only MF+Coverage \\
-    --defense_file ./Datasets/hijacking_focus_defense.jsonl \\
-    --cluster_k 8 \\
-    --openai_key sk-... \\
-    --embedding_cache ./defense_embeddings.npy
+get_coverage_metric.py  —  with --plot support
 """
 
-import argparse
-import os
-import sys
-import json
-import ast
+import argparse, os, sys, json, ast
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'PromptFuzz', 'Fuzzer')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'PromptFuzz')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+def load_defenses(f):
+    with open(f, encoding='utf-8') as fp:
+        return [json.loads(l) for l in fp if l.strip()]
 
-# ────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────────────────────────────────
+def build_cluster_labels(defenses, k, openai_key, cache=None):
+    from sklearn.cluster import KMeans
+    from gptfuzzer.llm import OpenAIEmbeddingLLM
+    n = len(defenses); k = min(k, n)
+    emb = None
+    if cache and os.path.exists(cache):
+        emb = np.load(cache)
+        if len(emb) != n: emb = None
+    if emb is None:
+        print(f"Computing {n} embeddings...")
+        m = OpenAIEmbeddingLLM("text-embedding-ada-002", openai_key)
+        texts = [(d.get("pre_prompt","")+" "+d.get("post_prompt","")).strip() for d in defenses]
+        emb = np.array([m.get_embedding(t) for t in texts], dtype=np.float32)
+        if cache: np.save(cache, emb); print(f"Saved to {cache}")
+    km = KMeans(n_clusters=k, random_state=42, n_init=10); km.fit(emb)
+    return km.labels_
 
-def load_defenses(defense_file: str):
-    with open(defense_file) as f:
-        return [json.loads(line) for line in f]
-
-
-def build_cluster_labels(defenses, cluster_k, openai_key, cache_path=None):
-    """Embed defenses and cluster into K families.  Returns np.ndarray of labels."""
-    try:
-        from sklearn.cluster import KMeans
-        from gptfuzzer.llm import OpenAIEmbeddingLLM
-    except ImportError as e:
-        raise ImportError(f"Missing dependency: {e}. Install scikit-learn and openai.")
-
-    n = len(defenses)
-    k = min(cluster_k, n)
-
-    # ── Load or compute embeddings ────────────────────────────────────────
-    embeddings = None
-    if cache_path and os.path.exists(cache_path):
-        embeddings = np.load(cache_path)
-        if len(embeddings) != n:
-            print(f"[WARNING] Cached embeddings size {len(embeddings)} != {n}. Recomputing.")
-            embeddings = None
-
-    if embeddings is None:
-        print(f"Computing embeddings for {n} defenses...")
-        model = OpenAIEmbeddingLLM("text-embedding-ada-002", openai_key)
-        texts = [
-            (d.get("pre_prompt", "") + " " + d.get("post_prompt", "")).strip()
-            for d in defenses
-        ]
-        embeddings = np.array([model.get_embedding(t) for t in texts], dtype=np.float32)
-        if cache_path:
-            np.save(cache_path, embeddings)
-            print(f"Embeddings saved to {cache_path}")
-
-    # ── Cluster ───────────────────────────────────────────────────────────
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-    kmeans.fit(embeddings)
-    return kmeans.labels_
-
-
-def load_result_csv(path: str) -> pd.DataFrame:
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        df = pd.read_csv(path, on_bad_lines='skip').dropna()
+def load_csv(path):
+    try: df = pd.read_csv(path)
+    except: df = pd.read_csv(path, on_bad_lines='skip').dropna()
     df['results_list'] = df['results'].apply(lambda x: ast.literal_eval(str(x)))
     return df
 
+def compute(df, labels, ndef, top_k=5):
+    nc = int(labels.max())+1
+    mat = np.array([( list(r)+[0]*ndef )[:ndef] for r in df['results_list']], dtype=int)
+    asr = mat.sum(1)/ndef
+    best_asr = float(asr.max())
+    ens = np.bitwise_or.reduce(mat[np.argsort(asr)[-top_k:]])
+    ens_asr = float(ens.sum()/ndef)
+    def_cov = float(mat.any(0).sum()/ndef)
+    cr = {}
+    for c in range(nc):
+        idx = np.where(labels==c)[0]
+        cr[c] = {'covered': bool(mat[:,idx].any()),
+                 'defenses_in_cluster': len(idx),
+                 'defenses_broken': int(mat[:,idx].any(0).sum())}
+    fam_cov = sum(v['covered'] for v in cr.values())/nc
+    fam_int = sum(v['covered'] for v in cr.values())
+    tq = int(df['query'].max()) if 'query' in df.columns else len(df)
+    eff = fam_int/(tq/100) if tq>0 else 0.0
+    covered_set=set(); cq=[]; cc=[]
+    for _,row in df.iterrows():
+        q=row.get('query',len(cq)+1)
+        for i,h in enumerate(row['results_list']):
+            if h==1 and i<len(labels): covered_set.add(int(labels[i]))
+        cq.append(q); cc.append(len(covered_set)/nc)
+    def qth(t):
+        for q,c in zip(cq,cc):
+            if c>=t: return q
+        return None
+    return dict(best_asr=round(best_asr,4), ensemble_asr=round(ens_asr,4),
+                defense_coverage=round(def_cov,4), family_coverage=round(fam_cov,4),
+                families_broken=f"{fam_int}/{nc}", families_broken_int=fam_int,
+                n_clusters=nc, total_queries=tq,
+                efficiency_per_100q=round(eff,4),
+                queries_to_25pct=qth(0.25), queries_to_50pct=qth(0.50), queries_to_75pct=qth(0.75),
+                cluster_report=cr, coverage_curve=(cq,cc), results_matrix=mat)
 
-# ────────────────────────────────────────────────────────────────────────────
-# Core metric functions
-# ────────────────────────────────────────────────────────────────────────────
-
-def defense_coverage_by_cluster(results_matrix: np.ndarray, cluster_labels: np.ndarray):
-    """
-    Given a (num_attacks, num_defenses) binary results matrix and cluster labels,
-    return per-cluster coverage.
-
-    Returns
-    -------
-    dict: {cluster_id: {'covered': bool, 'defenses_in_cluster': int,
-                         'defenses_broken': int}}
-    """
-    n_clusters = int(cluster_labels.max()) + 1
-    report = {}
-    for c in range(n_clusters):
-        member_indices = np.where(cluster_labels == c)[0]
-        # A cluster is "covered" if at least one attack broke at least one defense in it
-        any_broken = results_matrix[:, member_indices].any()
-        n_broken = int(results_matrix[:, member_indices].any(axis=0).sum())
-        report[c] = {
-            'covered': bool(any_broken),
-            'defenses_in_cluster': len(member_indices),
-            'defenses_broken': n_broken,
-        }
-    return report
-
-
-def coverage_curve(df: pd.DataFrame, cluster_labels: np.ndarray, defense_num: int):
-    """
-    Compute coverage fraction at each successive query checkpoint.
-    Returns (query_checkpoints, coverage_fractions).
-    """
-    n_clusters = int(cluster_labels.max()) + 1
-    covered = set()
-    curve_queries = []
-    curve_coverage = []
-
-    cumulative_queries = 0
-    for _, row in df.iterrows():
-        results = row['results_list']
-        q_cost = row.get('query', len(results))
-        cumulative_queries = q_cost  # query column = cumulative queries at this point
-
-        for def_idx, hit in enumerate(results):
-            if hit == 1 and def_idx < len(cluster_labels):
-                covered.add(int(cluster_labels[def_idx]))
-
-        curve_queries.append(cumulative_queries)
-        curve_coverage.append(len(covered) / n_clusters)
-
-    return curve_queries, curve_coverage
-
-
-def queries_to_coverage_threshold(curve_queries, curve_coverage, threshold: float):
-    """Return the first query count at which coverage_fraction >= threshold."""
-    for q, c in zip(curve_queries, curve_coverage):
-        if c >= threshold:
-            return q
-    return None   # never reached
-
-
-def compute_all_metrics(
-    df: pd.DataFrame,
-    cluster_labels: np.ndarray,
-    defense_num: int,
-    top_k: int = 5,
-):
-    """
-    Compute the full metric suite for one experimental condition.
-    """
-    n_clusters = int(cluster_labels.max()) + 1
-
-    # ── Build results matrix — pad/clip to defense_num width ─────────────
-    padded = []
-    for r in df['results_list']:
-        row = list(r) + [0] * defense_num
-        padded.append(row[:defense_num])
-    results_matrix = np.array(padded, dtype=int)  # (N_attacks, defense_num)
-
-    # ── Standard metrics (matching get_metric.py) ─────────────────────────
-    asr_per_attack = results_matrix.sum(axis=1) / defense_num
-    best_asr = float(asr_per_attack.max())
-
-    top_idx = np.argsort(asr_per_attack)[-top_k:]
-    ens_union = np.bitwise_or.reduce(results_matrix[top_idx])
-    ensemble_asr = float(ens_union.sum() / defense_num)
-
-    all_covered = results_matrix.any(axis=0)
-    coverage_metric = float(all_covered.sum() / defense_num)
-
-    # ── Per-cluster coverage ──────────────────────────────────────────────
-    cluster_report = defense_coverage_by_cluster(results_matrix, cluster_labels)
-    family_coverage = sum(v['covered'] for v in cluster_report.values()) / n_clusters
-
-    # ── Coverage curve ────────────────────────────────────────────────────
-    total_queries = int(df['query'].max()) if 'query' in df.columns else len(df)
-    cq, cc = coverage_curve(df, cluster_labels, defense_num)
-    q25 = queries_to_coverage_threshold(cq, cc, 0.25)
-    q50 = queries_to_coverage_threshold(cq, cc, 0.50)
-    q75 = queries_to_coverage_threshold(cq, cc, 0.75)
-
-    # ── Efficiency ───────────────────────────────────────────────────────
-    families_broken = sum(v['covered'] for v in cluster_report.values())
-    efficiency = families_broken / (total_queries / 100) if total_queries > 0 else 0.0
-
-    return {
-        'best_asr': round(best_asr, 4),
-        'ensemble_asr': round(ensemble_asr, 4),
-        'defense_coverage': round(coverage_metric, 4),
-        'family_coverage': round(family_coverage, 4),
-        'families_broken': f"{families_broken}/{n_clusters}",
-        'total_queries': total_queries,
-        'efficiency_per_100q': round(efficiency, 4),
-        'queries_to_25pct_family_coverage': q25,
-        'queries_to_50pct_family_coverage': q50,
-        'queries_to_75pct_family_coverage': q75,
-        'cluster_report': cluster_report,
-        'coverage_curve': (cq, cc),
-    }
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Printing helpers
-# ────────────────────────────────────────────────────────────────────────────
-
-def print_single(label: str, metrics: dict):
-    cr = metrics.pop('cluster_report')
-    metrics.pop('coverage_curve')
-
-    print(f"\n{'='*60}")
-    print(f"  {label}")
-    print(f"{'='*60}")
-    for k, v in metrics.items():
-        print(f"  {k:<42} {v}")
-
+def print_single(label, m):
+    cr=m['cluster_report']
+    print(f"\n{'='*60}\n  {label}\n{'='*60}")
+    for k in ['best_asr','ensemble_asr','defense_coverage','family_coverage',
+              'families_broken','total_queries','efficiency_per_100q',
+              'queries_to_25pct','queries_to_50pct','queries_to_75pct']:
+        print(f"  {k:<44} {m[k]}")
     print(f"\n  Per-cluster breakdown:")
-    print(f"  {'Cluster':>8}  {'Covered':>8}  {'Defs in cluster':>16}  {'Defs broken':>12}")
-    for c, info in sorted(cr.items()):
-        mark = '✓' if info['covered'] else '✗'
-        print(f"  {c:>8}  {mark:>8}  {info['defenses_in_cluster']:>16}  {info['defenses_broken']:>12}")
+    print(f"  {'Cluster':>8}  {'Covered':>8}  {'In cluster':>12}  {'Broken':>8}")
+    for c,v in sorted(cr.items()):
+        print(f"  {c:>8}  {'✓' if v['covered'] else '✗':>8}  {v['defenses_in_cluster']:>12}  {v['defenses_broken']:>8}")
 
-
-def print_comparison(labels, all_metrics):
-    keys = [
-        'best_asr', 'ensemble_asr', 'defense_coverage',
-        'family_coverage', 'families_broken', 'total_queries',
-        'efficiency_per_100q',
-        'queries_to_25pct_family_coverage',
-        'queries_to_50pct_family_coverage',
-        'queries_to_75pct_family_coverage',
-    ]
-    col_w = max(len(l) for l in labels) + 2
-    print(f"\n{'Metric':<44}", end="")
-    for l in labels:
-        print(f"{l:>{col_w}}", end="")
-    print()
-    print("-" * (44 + col_w * len(labels)))
-
+def print_comparison(labels, mlist):
+    keys=['best_asr','ensemble_asr','defense_coverage','family_coverage',
+          'families_broken','total_queries','efficiency_per_100q',
+          'queries_to_25pct','queries_to_50pct','queries_to_75pct']
+    w=max(len(l) for l in labels)+4
+    print(f"\n{'Metric':<46}"+"".join(f"{l:>{w}}" for l in labels))
+    print("-"*(46+w*len(labels)))
     for k in keys:
-        print(f"  {k:<42}", end="")
-        for m in all_metrics:
-            val = str(m.get(k, 'N/A'))
-            print(f"{val:>{col_w}}", end="")
-        print()
+        print(f"  {k:<44}"+"".join(f"{str(m.get(k,'N/A')):>{w}}" for m in mlist))
 
+def make_plots(labels, all_metrics, plot_dir):
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    os.makedirs(plot_dir, exist_ok=True)
+    COLS = ['#2E5FAB','#059669','#D97706','#DC2626','#7C3AED']
+    cols = COLS[:len(labels)]
 
-# ────────────────────────────────────────────────────────────────────────────
-# Main
-# ────────────────────────────────────────────────────────────────────────────
+    # ── 1. Efficiency ────────────────────────────────────────────────────────
+    fig,ax=plt.subplots(figsize=(7,4.5))
+    vals=[m['efficiency_per_100q'] for m in all_metrics]
+    bars=ax.bar(labels,vals,color=cols,width=0.5,edgecolor='white',linewidth=1.2)
+    for b,v in zip(bars,vals):
+        ax.text(b.get_x()+b.get_width()/2,b.get_height()+0.03,f'{v:.2f}',
+                ha='center',va='bottom',fontsize=13,fontweight='bold')
+    ax.set_ylabel('Families Broken per 100 Queries',fontsize=12)
+    ax.set_title('Query Efficiency Comparison',fontsize=14,fontweight='bold',pad=12)
+    ax.set_ylim(0,max(vals)*1.35); ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.tight_layout(); p=os.path.join(plot_dir,'1_efficiency.png'); plt.savefig(p,dpi=150,bbox_inches='tight'); plt.close(); print(f"Saved: {p}")
+
+    # ── 2. Total queries ─────────────────────────────────────────────────────
+    fig,ax=plt.subplots(figsize=(7,4.5))
+    vals=[m['total_queries'] for m in all_metrics]
+    bars=ax.bar(labels,vals,color=cols,width=0.5,edgecolor='white',linewidth=1.2)
+    for b,v in zip(bars,vals):
+        ax.text(b.get_x()+b.get_width()/2,b.get_height()+5,str(v),
+                ha='center',va='bottom',fontsize=13,fontweight='bold')
+    ax.set_ylabel('Total API Queries',fontsize=12)
+    ax.set_title('Total Query Cost Comparison',fontsize=14,fontweight='bold',pad=12)
+    ax.set_ylim(0,max(vals)*1.25); ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.tight_layout(); p=os.path.join(plot_dir,'2_queries.png'); plt.savefig(p,dpi=150,bbox_inches='tight'); plt.close(); print(f"Saved: {p}")
+
+    # ── 3. Grouped metrics ───────────────────────────────────────────────────
+    mkeys=['best_asr','ensemble_asr','defense_coverage','family_coverage']
+    mnames=['Best ASR','Ensemble ASR','Defense\nCoverage','Family\nCoverage']
+    x=np.arange(len(mkeys)); w=0.8/len(labels)
+    fig,ax=plt.subplots(figsize=(9,5))
+    for i,(lbl,m,col) in enumerate(zip(labels,all_metrics,cols)):
+        vs=[m[k] for k in mkeys]; off=(i-len(labels)/2+0.5)*w
+        bars=ax.bar(x+off,vs,w,label=lbl,color=col,edgecolor='white',linewidth=0.8)
+        for b,v in zip(bars,vs):
+            ax.text(b.get_x()+b.get_width()/2,b.get_height()+0.005,f'{v:.2f}',
+                    ha='center',va='bottom',fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels(mnames,fontsize=11)
+    ax.set_ylabel('Score',fontsize=12); ax.set_title('Metric Comparison',fontsize=14,fontweight='bold',pad=12)
+    ax.set_ylim(0,1.18); ax.legend(fontsize=10,framealpha=0.3)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.tight_layout(); p=os.path.join(plot_dir,'3_metrics.png'); plt.savefig(p,dpi=150,bbox_inches='tight'); plt.close(); print(f"Saved: {p}")
+
+    # ── 4. Radar — per cluster ───────────────────────────────────────────────
+    nc=all_metrics[0]['n_clusters']
+    angles=np.linspace(0,2*np.pi,nc,endpoint=False).tolist(); angles+=angles[:1]
+    fig,ax=plt.subplots(figsize=(6,6),subplot_kw=dict(polar=True))
+    for lbl,m,col in zip(labels,all_metrics,cols):
+        cr=m['cluster_report']
+        vs=[1 if cr[c]['covered'] else 0 for c in range(nc)]; vs+=vs[:1]
+        ax.plot(angles,vs,'o-',linewidth=2,color=col,label=lbl)
+        ax.fill(angles,vs,alpha=0.12,color=col)
+    ax.set_xticks(angles[:-1]); ax.set_xticklabels([f'C{c}' for c in range(nc)],fontsize=10)
+    ax.set_yticks([0,1]); ax.set_yticklabels(['Not Broken','Broken'],fontsize=8); ax.set_ylim(0,1.25)
+    ax.set_title('Per-Cluster Coverage\n(Defense Families)',fontsize=13,fontweight='bold',pad=20)
+    ax.legend(loc='upper right',bbox_to_anchor=(1.35,1.1),fontsize=10)
+    plt.tight_layout(); p=os.path.join(plot_dir,'4_radar.png'); plt.savefig(p,dpi=150,bbox_inches='tight'); plt.close(); print(f"Saved: {p}")
+
+    # ── 5. Coverage curve ────────────────────────────────────────────────────
+    fig,ax=plt.subplots(figsize=(8,5))
+    for lbl,m,col in zip(labels,all_metrics,cols):
+        qs,cs=m['coverage_curve']
+        ax.step(qs,[c*100 for c in cs],where='post',color=col,linewidth=2.5,label=lbl)
+        if qs: ax.scatter(qs[-1],cs[-1]*100,color=col,s=80,zorder=5)
+    ax.axhline(y=100,color='gray',linestyle='--',linewidth=1,alpha=0.4,label='100% coverage')
+    ax.set_xlabel('Total Queries (API Calls)',fontsize=12)
+    ax.set_ylabel('Defense Families Covered (%)',fontsize=12)
+    ax.set_title('Coverage Curve: Family Coverage vs Query Budget',fontsize=13,fontweight='bold',pad=12)
+    ax.set_ylim(0,115); ax.legend(fontsize=10,framealpha=0.3)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.tight_layout(); p=os.path.join(plot_dir,'5_coverage_curve.png'); plt.savefig(p,dpi=150,bbox_inches='tight'); plt.close(); print(f"Saved: {p}")
+
+    # ── 6. Stage savings ─────────────────────────────────────────────────────
+    fig,ax=plt.subplots(figsize=(8,4.5))
+    stages=['Stage 1\n(20% defenses)','Stage 2\n(50% defenses)','Stage 3\n(100% defenses)']
+    promoted=[2,1,1]; eliminated=[3,1,0]; savings=[360,75,0]
+    x=np.arange(3); w=0.35
+    b1=ax.bar(x-w/2,promoted,w,label='Promoted',color='#059669',edgecolor='white')
+    b2=ax.bar(x+w/2,eliminated,w,label='Eliminated',color='#DC2626',edgecolor='white')
+    for b,v in zip(b1,promoted):
+        ax.text(b.get_x()+b.get_width()/2,b.get_height()+0.05,str(v),ha='center',va='bottom',fontsize=12,fontweight='bold')
+    for b,v,s in zip(b2,eliminated,savings):
+        ax.text(b.get_x()+b.get_width()/2,b.get_height()+0.05,str(v),ha='center',va='bottom',fontsize=12,fontweight='bold',color='#DC2626')
+        if s>0:
+            ax.text(b.get_x()+b.get_width()/2,b.get_height()+0.4,f'~{s}q saved',
+                    ha='center',va='bottom',fontsize=9,color='#7B3F00',style='italic')
+    ax.set_xticks(x); ax.set_xticklabels(stages,fontsize=11)
+    ax.set_ylabel('Number of Mutants',fontsize=12)
+    ax.set_title('Multi-Fidelity Scheduler: Stage-by-Stage Elimination\n(~435 queries saved in one iteration)',
+                 fontsize=13,fontweight='bold',pad=12)
+    ax.set_ylim(0,6); ax.legend(fontsize=10,framealpha=0.3)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.tight_layout(); p=os.path.join(plot_dir,'6_stage_savings.png'); plt.savefig(p,dpi=150,bbox_inches='tight'); plt.close(); print(f"Saved: {p}")
+
+    print(f"\nAll 6 plots saved to: {os.path.abspath(plot_dir)}")
 
 def main(args):
-    defenses = load_defenses(args.defense_file)
-    defense_num = len(defenses)
-
-    cluster_labels = build_cluster_labels(
-        defenses,
-        cluster_k=args.cluster_k,
-        openai_key=args.openai_key,
-        cache_path=args.embedding_cache,
-    )
+    defenses=load_defenses(args.defense_file)
+    ndef=len(defenses)
+    labels_arr=build_cluster_labels(defenses,args.cluster_k,args.openai_key,args.embedding_cache)
 
     if args.compare:
-        assert args.result_csvs and args.labels, \
-            "--result_csvs and --labels required with --compare"
-        assert len(args.result_csvs) == len(args.labels), \
-            "--result_csvs and --labels must have same length"
-
-        all_metrics = []
-        for path, label in zip(args.result_csvs, args.labels):
-            df = load_result_csv(path)
-            m = compute_all_metrics(df, cluster_labels, defense_num, top_k=args.top_k)
-            all_metrics.append(m)
-
-        # Strip non-scalar fields before comparison table
-        for m in all_metrics:
-            m.pop('cluster_report', None)
-            m.pop('coverage_curve', None)
-
-        print_comparison(args.labels, all_metrics)
-
+        assert args.result_csvs and args.labels
+        assert len(args.result_csvs)==len(args.labels)
+        all_m=[]
+        for path,lbl in zip(args.result_csvs,args.labels):
+            df=load_csv(path); m=compute(df,labels_arr,ndef,args.top_k); all_m.append(m)
+        printable=[{k:v for k,v in m.items() if k not in ('cluster_report','coverage_curve','results_matrix')} for m in all_m]
+        print_comparison(args.labels,printable)
         if args.save_path:
-            rows = []
-            for label, m in zip(args.labels, all_metrics):
-                row = {'condition': label}
-                row.update(m)
-                rows.append(row)
-            pd.DataFrame(rows).to_csv(args.save_path, index=False)
-            print(f"\nComparison saved to {args.save_path}")
-
+            pd.DataFrame([{'condition':l,**p} for l,p in zip(args.labels,printable)]).to_csv(args.save_path,index=False)
+            print(f"\nSaved to {args.save_path}")
+        if args.plot: make_plots(args.labels,all_m,args.plot_dir)
     else:
-        assert args.result_csv, "--result_csv required"
-        df = load_result_csv(args.result_csv)
-        m = compute_all_metrics(df, cluster_labels, defense_num, top_k=args.top_k)
-        label = os.path.basename(args.result_csv)
-        print_single(label, m)
-
+        assert args.result_csv
+        df=load_csv(args.result_csv); m=compute(df,labels_arr,ndef,args.top_k)
+        lbl=os.path.basename(args.result_csv); print_single(lbl,m)
         if args.save_path:
-            pd.DataFrame([{k: v for k, v in m.items()}]).to_csv(
-                args.save_path, index=False
-            )
-            print(f"\nMetrics saved to {args.save_path}")
+            pd.DataFrame([{k:v for k,v in m.items() if k not in ('cluster_report','coverage_curve','results_matrix')}]).to_csv(args.save_path,index=False)
+        if args.plot: make_plots([lbl],[m],args.plot_dir)
 
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description='Coverage-extended metrics for budget-aware PromptFuzz'
-    )
-    # Single-file mode
-    parser.add_argument('--result_csv', type=str, default=None,
-                        help='Path to a single results CSV')
-    # Comparison mode
-    parser.add_argument('--compare', action='store_true',
-                        help='Compare multiple conditions side-by-side')
-    parser.add_argument('--result_csvs', type=str, nargs='+', default=None,
-                        help='Paths to result CSVs (one per condition, with --compare)')
-    parser.add_argument('--labels', type=str, nargs='+', default=None,
-                        help='Labels for each condition (with --compare)')
-    # Shared
-    parser.add_argument('--defense_file', type=str, required=True,
-                        help='Path to the defense .jsonl file used during the run')
-    parser.add_argument('--cluster_k', type=int, default=8,
-                        help='Number of defense family clusters (must match training run)')
-    parser.add_argument('--openai_key', type=str, default=None,
-                        help='OpenAI API key (for embedding computation)')
-    parser.add_argument('--embedding_cache', type=str, default=None,
-                        help='Path to cached defense embeddings (.npy)')
-    parser.add_argument('--top_k', type=int, default=5,
-                        help='Top-K for ensemble ASR (default 5)')
-    parser.add_argument('--save_path', type=str, default=None,
-                        help='Path to save metrics CSV')
-
-    args = parser.parse_args()
-
-    if args.openai_key is None:
-        try:
-            sys.path.insert(0, os.path.abspath(
-                os.path.join(os.path.dirname(__file__), '..', 'PromptFuzz')
-            ))
-            from utils import constants
-            args.openai_key = constants.openai_key
-        except Exception:
-            pass
-
+if __name__=='__main__':
+    p=argparse.ArgumentParser()
+    p.add_argument('--result_csv',type=str,default=None)
+    p.add_argument('--compare',action='store_true')
+    p.add_argument('--result_csvs',type=str,nargs='+',default=None)
+    p.add_argument('--labels',type=str,nargs='+',default=None)
+    p.add_argument('--defense_file',type=str,required=True)
+    p.add_argument('--cluster_k',type=int,default=8)
+    p.add_argument('--openai_key',type=str,default=None)
+    p.add_argument('--embedding_cache',type=str,default=None)
+    p.add_argument('--top_k',type=int,default=5)
+    p.add_argument('--save_path',type=str,default=None)
+    p.add_argument('--plot',action='store_true')
+    p.add_argument('--plot_dir',type=str,default='./plots')
+    args=p.parse_args()
     if not args.openai_key:
-        print("ERROR: --openai_key required (or set in PromptFuzz/utils/constants.py)")
-        sys.exit(1)
-
+        try:
+            sys.path.insert(0,os.path.abspath(os.path.join(os.path.dirname(__file__),'..','PromptFuzz')))
+            from utils import constants; args.openai_key=constants.openai_key
+        except: pass
+    if not args.openai_key: print("ERROR: --openai_key required"); sys.exit(1)
     main(args)

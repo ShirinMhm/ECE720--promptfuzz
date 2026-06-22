@@ -111,7 +111,7 @@ class GPTFuzzer:
         if result_file is None:
             result_file = f'results-{time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())}.csv'
 
-        self.raw_fp = open(result_file, 'w', buffering=1, encoding='utf-8')
+        self.raw_fp = open(result_file, 'w', buffering=1)
         self.writter = csv.writer(self.raw_fp)
         self.writter.writerow(
             ['index', 'prompt', 'response', 'parent', 'results', 'mutation', 'query'])
@@ -217,6 +217,18 @@ class GPTFuzzer:
             # Update the highest jailbreak count in history
             if prompt_node.num_jailbreak > self.highest_jailbreak:
                 self.highest_jailbreak = prompt_node.num_jailbreak
+
+            # Update defense-family coverage (Part B)
+            if (
+                self.scheduler is not None
+                and hasattr(self.scheduler, 'coverage_tracker')
+                and self.scheduler.coverage_tracker is not None
+                and prompt_node.prompt not in ('early termination', 'budget_eliminated')
+            ):
+                def_indices = self.scheduler._last_eval_def_indices.get(
+                    id(prompt_node), []
+                )
+                self.scheduler.coverage_tracker.update_coverage(prompt_node, def_indices)
 
         self.select_policy.update(prompt_nodes)
 

@@ -31,10 +31,11 @@ whose pessimistic ASR estimate is too low to be useful.
 import math
 import logging
 import numpy as np
-from typing import List, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gptfuzzer.fuzzer.core import PromptNode, GPTFuzzer
+    from gptfuzzer.fuzzer.coverage_tracker import DefenseCoverageTracker
 
 # Sentinel string used to mark budget-eliminated nodes (mirrors 'early termination')
 BUDGET_ELIMINATED = "budget_eliminated"
@@ -61,11 +62,16 @@ class MultiFidelityScheduler:
         Length must be len(stage_fractions) - 1.
         E.g. [0.5, 0.5] keeps top-50% at each transition.
     promotion_threshold : float
-        Minimum LCB score required for promotion.  Mutants with LCB below
+        Minimum score required for promotion.  Mutants with score below
         this are eliminated even if they are in the top-k.
-        Set to 0.0 to always promote top-k regardless of absolute LCB.
+        Set to 0.0 to always promote top-k regardless of absolute score.
+    coverage_tracker : DefenseCoverageTracker or None
+        If provided, enables Part B:
+          - D1 ordering becomes coverage-aware (novel clusters first)
+          - Promotion scoring uses combined  λ·LCB + (1-λ)·Novelty
     seed : int or None
-        Random seed for the defense shuffle (for reproducibility).
+        Random seed for the defense shuffle (used only when coverage_tracker
+        is None, i.e. in pure budget-aware mode).
     """
 
     def __init__(
@@ -75,6 +81,7 @@ class MultiFidelityScheduler:
         beta: float = 1.0,
         top_k_fractions: List[float] = (0.5, 0.5),
         promotion_threshold: float = 0.0,
+        coverage_tracker: "Optional[DefenseCoverageTracker]" = None,
         seed: int = 42,
     ):
         assert len(top_k_fractions) == len(stage_fractions) - 1, (
@@ -91,10 +98,15 @@ class MultiFidelityScheduler:
         self.beta = beta
         self.top_k_fractions = list(top_k_fractions)
         self.promotion_threshold = promotion_threshold
+        self.coverage_tracker = coverage_tracker
         self.seed = seed
 
         # Defense stage index lists – built lazily once fuzzer is set
         self._defense_stages: List[List[int]] = []
+
+        # Per-iteration record of which defense indices were evaluated for each node
+        # Used by coverage_tracker.update_coverage() and novelty()
+        self._last_eval_def_indices: dict = {}   # node_id → list[int]
 
         # Tracking / diagnostics
         self.total_queries_saved: int = 0
@@ -108,25 +120,34 @@ class MultiFidelityScheduler:
     def setup(self):
         """
         Build defense stage index lists.  Called after self.fuzzer is set.
-        Defense order is shuffled once with a fixed seed so that D1 is a
-        reproducible random sample of the full defense set.
-        (Coverage-guided defense selection, i.e. embedding-based clustering,
-        can replace this shuffle in the Part B extension.)
+
+        When a coverage_tracker is available, D1 uses coverage-aware ordering
+        (novel-cluster defenses first) so Stage 1 maximises diagnostic value.
+        Without a tracker, a fixed random shuffle is used.
         """
         assert self.fuzzer is not None, "fuzzer must be set before calling setup()"
         n = len(self.fuzzer.defenses)
-        rng = np.random.default_rng(self.seed)
-        shuffled = rng.permutation(n).tolist()
+
+        if self.coverage_tracker is not None:
+            # Coverage-aware ordering: novel clusters first
+            if self.coverage_tracker.defense_labels is None:
+                self.coverage_tracker.setup(self.fuzzer.defenses)
+            ordered = self.coverage_tracker.coverage_aware_ordering()
+        else:
+            # Pure random shuffle (Part A only)
+            rng = np.random.default_rng(self.seed)
+            ordered = rng.permutation(n).tolist()
 
         self._defense_stages = []
         for frac in self.stage_fractions:
             size = max(1, int(round(frac * n)))
-            # Each stage stores the *cumulative* defense indices up to that point
-            self._defense_stages.append(shuffled[:size])
+            self._defense_stages.append(ordered[:size])
 
         stage_sizes = [len(s) for s in self._defense_stages]
+        mode = "coverage-aware" if self.coverage_tracker else "random"
         logging.info(
-            f"[MultiFidelity] Defense stages built: {stage_sizes} out of {n} total defenses"
+            f"[MultiFidelity] Defense stages built ({mode}): "
+            f"{stage_sizes} out of {n} total defenses"
         )
 
     # ------------------------------------------------------------------
@@ -145,6 +166,9 @@ class MultiFidelityScheduler:
         The length of node.results equals the number of defenses *actually*
         evaluated for that node (not the full |D|), so current_query correctly
         reflects real API calls made.
+
+        Also records which defense indices were evaluated for each node in
+        self._last_eval_def_indices, used by the coverage tracker.
         """
         if not self._defense_stages:
             self.setup()
@@ -157,15 +181,16 @@ class MultiFidelityScheduler:
             pn.results = []
 
         messages = [pn.prompt for pn in prompt_nodes]
-        # active_set: indices into prompt_nodes that are still in the running
         active_set = list(range(len(prompt_nodes)))
         evaluated_def_indices: set = set()
+        # Track ordered list of def indices per node (for coverage tracker)
+        node_def_indices: dict = {i: [] for i in range(len(prompt_nodes))}
 
         for stage_idx, cumulative_def_indices in enumerate(self._defense_stages):
             if not active_set:
                 break
 
-            # Defenses that are new at this stage (not yet evaluated)
+            # Defenses new at this stage
             new_def_indices = [
                 i for i in cumulative_def_indices if i not in evaluated_def_indices
             ]
@@ -183,9 +208,12 @@ class MultiFidelityScheduler:
                     responses, defense["access_code"]
                 )
 
-                for pn, resp, pred in zip(active_nodes, responses, predictions):
+                for node_pos, (pn, resp, pred) in enumerate(
+                    zip(active_nodes, responses, predictions)
+                ):
                     pn.response.append(resp)
                     pn.results.append(pred)
+                    node_def_indices[active_set[node_pos]].append(def_i)
 
             evaluated_def_indices.update(new_def_indices)
             n_evaluated = len(evaluated_def_indices)
@@ -196,18 +224,28 @@ class MultiFidelityScheduler:
                 top_k_frac = self.top_k_fractions[stage_idx]
                 k = max(1, int(round(len(active_set) * top_k_frac)))
 
-                # Score each active mutant by LCB
-                scored = [
-                    (i, self._lcb(prompt_nodes[i], n_evaluated, T))
-                    for i in active_set
-                ]
+                # Score: combined λ·LCB + (1-λ)·Novelty if tracker available,
+                # else pure LCB
+                scored = []
+                for i in active_set:
+                    pn = prompt_nodes[i]
+                    if self.coverage_tracker is not None:
+                        score = self.coverage_tracker.combined_score(
+                            pn,
+                            def_indices_evaluated=node_def_indices[i],
+                            n_evaluated=n_evaluated,
+                            T=T,
+                            beta=self.beta,
+                        )
+                    else:
+                        score = self._lcb(pn, n_evaluated, T)
+                    scored.append((i, score))
+
                 scored.sort(key=lambda x: x[1], reverse=True)
 
-                # Promote top-k that exceed the threshold
                 promoted = [
-                    idx
-                    for idx, lcb in scored[:k]
-                    if lcb >= self.promotion_threshold
+                    idx for idx, sc in scored[:k]
+                    if sc >= self.promotion_threshold
                 ]
                 eliminated = [
                     idx for idx, _ in scored if idx not in set(promoted)
@@ -217,44 +255,62 @@ class MultiFidelityScheduler:
                 self.total_queries_saved += len(eliminated) * n_remaining_defs
                 self.stage_elimination_counts[stage_idx] += len(eliminated)
 
+                mode = "coverage+LCB" if self.coverage_tracker else "LCB"
                 logging.info(
                     f"[MultiFidelity] Stage {stage_idx + 1}/{len(self._defense_stages)}: "
-                    f"{len(active_set)} mutants evaluated on {n_evaluated} defenses → "
-                    f"{len(promoted)} promoted, {len(eliminated)} eliminated "
+                    f"{len(active_set)} mutants | {n_evaluated} defenses | "
+                    f"scoring={mode} → {len(promoted)} promoted, "
+                    f"{len(eliminated)} eliminated "
                     f"(~{len(eliminated) * n_remaining_defs} queries saved)"
                 )
 
-                # Mark eliminated nodes
                 for idx in eliminated:
                     prompt_nodes[idx].prompt = BUDGET_ELIMINATED
 
                 active_set = promoted
 
-        # Any mutant still active after all stages has been fully evaluated.
-        # Any mutant marked BUDGET_ELIMINATED has partial results only —
-        # update() will handle them by checking the prompt string.
+        # Store per-node defense index lists so update() can call coverage_tracker
+        self._last_eval_def_indices = {
+            id(prompt_nodes[i]): node_def_indices[i]
+            for i in range(len(prompt_nodes))
+        }
 
+        for stage_idx, cumulative_def_indices in enumerate(self._defense_stages):
+            if not active_set:
+                break
+
+            # Defenses that are new at this stage (not yet evaluated)
+            new_def_indices = [
+                i for i in cumulative_def_indices if i not in evaluated_def_indices
+            ]
+            if not new_def_indices:
+                continue
+
+            # ----- Evaluate new defenses for active mutants -----
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
     def summary(self) -> str:
-        """Return a human-readable summary of budget savings."""
+        """Return a human-readable summary of budget savings and coverage."""
         total_possible = (
             len(self.fuzzer.defenses)
-            * sum(self.stage_promotion_counts[0:1])  # all mutants that entered stage 1
+            * sum(self.stage_promotion_counts[0:1])
         )
         pct_saved = (
             100.0 * self.total_queries_saved / total_possible
             if total_possible > 0
             else 0.0
         )
-        return (
-            f"[MultiFidelity Summary] "
+        base = (
+            f"[MultiFidelity] "
             f"Queries saved: {self.total_queries_saved} / {total_possible} "
             f"({pct_saved:.1f}%) | "
             f"Stage eliminations: {self.stage_elimination_counts}"
         )
+        if self.coverage_tracker is not None:
+            base += " | " + self.coverage_tracker.summary()
+        return base
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -4,12 +4,13 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 import json
-from gptfuzzer.fuzzer.selection import MCTSExploreSelectPolicy, RoundRobinSelectPolicy
+from gptfuzzer.fuzzer.selection import MCTSExploreSelectPolicy, RoundRobinSelectPolicy, CoverageGuidedSelectPolicy
 from gptfuzzer.fuzzer.mutator import (
     MutateRandomSinglePolicy, NoMutatePolicy, MutateWeightedSamplingPolicy, OpenAIMutatorCrossOver, OpenAIMutatorExpand,
     OpenAIMutatorGenerateSimilar, OpenAIMutatorRephrase, OpenAIMutatorShorten)
 from gptfuzzer.fuzzer import GPTFuzzer
 from gptfuzzer.fuzzer.budget_scheduler import MultiFidelityScheduler
+from gptfuzzer.fuzzer.coverage_tracker import DefenseCoverageTracker
 from gptfuzzer.utils.predict import MatchPredictor, AccessGrantedPredictor
 from gptfuzzer.llm import OpenAILLM, OpenAIEmbeddingLLM
 from PromptFuzz.utils import constants
@@ -130,7 +131,22 @@ def run_fuzzer(args):
         
     update_pool = True if args.phase == 'focus' else False
     
-    # Build multi-fidelity scheduler if requested
+    # ── Build coverage tracker (Part B) ─────────────────────────────────
+    coverage_tracker = None
+    if getattr(args, 'coverage_guided', False):
+        cluster_k = getattr(args, 'cluster_k', 8)
+        lam = getattr(args, 'coverage_lam', 0.7)
+        cache_path = getattr(args, 'embedding_cache', None)
+        embedding_model_cov = OpenAIEmbeddingLLM("text-embedding-ada-002", args.openai_key)
+        coverage_tracker = DefenseCoverageTracker(
+            embedding_model=embedding_model_cov,
+            cluster_k=cluster_k,
+            lam=lam,
+            embedding_cache_path=cache_path,
+        )
+        print(f"[Coverage] Tracker enabled: K={cluster_k}, λ={lam}")
+
+    # ── Build multi-fidelity scheduler (Part A + optional Part B) ───────
     scheduler = None
     if getattr(args, 'multifidelity', False):
         stage_fractions = getattr(args, 'stage_fractions', [0.2, 0.5, 1.0])
@@ -142,8 +158,17 @@ def run_fuzzer(args):
             beta=beta,
             top_k_fractions=top_k_fractions,
             promotion_threshold=promotion_threshold,
+            coverage_tracker=coverage_tracker,
         )
         print(f"[MultiFidelity] Scheduler enabled: stages={stage_fractions}, beta={beta}")
+
+    # ── Swap in coverage-guided seed selection when Part B is active ─────
+    if coverage_tracker is not None and args.phase == 'focus':
+        select_policy = CoverageGuidedSelectPolicy(
+            coverage_tracker=coverage_tracker,
+            lam=coverage_tracker.lam,
+        )
+        print(f"[Coverage] CoverageGuidedSelectPolicy active (λ={coverage_tracker.lam})")
 
     fuzzer = GPTFuzzer(
         defenses=args.defenses,
